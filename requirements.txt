@@ -1,0 +1,24 @@
+# 基礎
+streamlit>=1.36
+pandas>=2.0
+numpy>=1.24
+
+# 視覺化
+plotly>=5.22
+matplotlib>=3.8
+
+# 機器學習與預測
+scikit-learn>=1.4
+xgboost>=2.1
+prophet>=1.1
+
+# 資料庫 & 連線
+sqlalchemy>=2.0
+psycopg2-binary>=2.9  # PostgreSQL 驅動
+
+# 爬蟲 & API
+requests>=2.32
+beautifulsoup4>=4.12
+
+# 其他工具
+python-dateutil>=2.9
