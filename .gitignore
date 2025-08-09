@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Streamlit / secrets
+.streamlit/secrets.toml
+.secrets*/ 
+*.env
+
+# 本地資料與模型
+models_store/
+notebooks/.ipynb_checkpoints/
+data/
+*.pkl
+*.joblib
+
+# IDE
+.vscode/
+.DS_Store
