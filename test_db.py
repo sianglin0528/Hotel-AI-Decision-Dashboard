@@ -1,13 +1,15 @@
-from sqlalchemy import create_engine, text
+# test_db.py
+from api.src.db import get_engine
+from sqlalchemy import text
 
-# 你的 Postgres 連線字串
-DATABASE_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/mydb"
+def main():
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT NOW()"))
+            print("✅ DB 連線成功！現在時間：", result.fetchall())
+    except Exception as e:
+        print("❌ DB 連線失敗：", e)
 
-try:
-    engine = create_engine(DATABASE_URL, echo=True)
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT 1")).scalar()
-        print("✅ 成功連線到資料庫！查詢結果：", result)
-except Exception as e:
-    print("❌ 無法連線到資料庫")
-    print(e)
+if __name__ == "__main__":
+    main()

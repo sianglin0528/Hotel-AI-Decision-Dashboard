@@ -1,96 +1,96 @@
-import joblib, pandas as pd
-from datetime import date, timedelta
+from __future__ import annotations
+import pandas as pd
+import numpy as np
+from datetime import date
 from api.src.db import fetch_df
 
-def _future(days: int) -> pd.DataFrame:
-    start = date.today()
-    return pd.DataFrame({"ds": [start + timedelta(days=i) for i in range(int(days))]})
-
-def forecast_sales(days: int = 30) -> pd.DataFrame:
-    model  = joblib.load("models_store/sales.prophet.pkl")
-    future = _future(days)
-    out = model.predict(future)[["ds", "yhat"]].copy()
-    out.rename(columns={"ds": "Date", "yhat": "SalesForecast"}, inplace=True)
-    out["Date"] = pd.to_datetime(out["Date"]).dt.date
-    return out
-
-def forecast_occupancy(days: int = 30) -> pd.DataFrame:
-    model  = joblib.load("models_store/occ.prophet.pkl")
-    future = _future(days)
-    out = model.predict(future)[["ds", "yhat"]].copy()
-    out.rename(columns={"ds": "Date", "yhat": "OccForecast"}, inplace=True)
-    out["Date"] = pd.to_datetime(out["Date"]).dt.date
-    return out
-
-# 在 infer.py 補上
-def _load_hist_sales():
-    q = """
-    SELECT
-      dt::date               AS "Date",
-      rooms_sold::float      AS y,
-      rooms_available::float AS rooms_avail   -- 加這行，和訓練一致
+def _load_history():
+    sql = """
+    SELECT dt::date AS dt,
+           COALESCE(rooms_sold, 0) AS rooms_sold,
+           COALESCE(occupancy_rate, 0) AS occupancy
     FROM bookings_daily
-    ORDER BY dt
+    WHERE dt <= CURRENT_DATE
+    ORDER BY dt;
     """
-    df = fetch_df(q)
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-    return df
+    return fetch_df(sql)
 
-def _add_feats_for_xgb(df, LAGS, ROLLS):
-    df = df.copy().sort_values("Date")
-    for l in LAGS:
-        df[f"lag_{l}"] = df["y"].shift(l)
-    for w, stat in ROLLS:
-        if stat == "mean":
-            df[f"roll_{w}_mean"] = df["y"].rolling(w).mean()
-    df["dow"]   = df["Date"].dt.weekday
-    df["dom"]   = df["Date"].dt.day
-    df["month"] = df["Date"].dt.month
-    return df
+def _future_index(days: int) -> pd.DatetimeIndex:
+    return pd.date_range(start=pd.to_datetime(date.today()), periods=days, freq="D")
 
+# Prophet 版：銷售量
+def forecast_sales(days: int = 30) -> pd.DataFrame:
+    hist = _load_history()
+    ds = pd.to_datetime(hist["dt"])
+    y = hist["rooms_sold"].astype(float)
+
+    try:
+        from prophet import Prophet
+        m = Prophet(weekly_seasonality=True, yearly_seasonality=False, daily_seasonality=False)
+        m.fit(pd.DataFrame({"ds": ds, "y": y}))
+        future = pd.DataFrame({"ds": _future_index(days)})
+        fcst = m.predict(future)
+        yhat = np.maximum(0, np.round(fcst["yhat"]).astype(int))
+        return pd.DataFrame({"Date": fcst["ds"].dt.date, "SalesForecast": yhat})
+    except Exception:
+        # 後備：以星期幾平均 + 噪音
+        dow_avg = hist.groupby(pd.to_datetime(hist["dt"]).dt.dayofweek)["rooms_sold"].mean()
+        future = _future_index(days)
+        vals = [dow_avg.get(d.dayofweek, y.mean()) for d in future]
+        return pd.DataFrame({"Date": future.date, "SalesForecast": np.array(vals, int)})
+
+# Prophet 版：入住率（0~1）
+def forecast_occupancy(days: int = 30) -> pd.DataFrame:
+    hist = _load_history()
+    ds = pd.to_datetime(hist["dt"])
+    y = hist["occupancy"].astype(float)
+
+    try:
+        from prophet import Prophet
+        m = Prophet(weekly_seasonality=True, yearly_seasonality=False, daily_seasonality=False)
+        m.fit(pd.DataFrame({"ds": ds, "y": y}))
+        future = pd.DataFrame({"ds": _future_index(days)})
+        fcst = m.predict(future)
+        occ = np.clip(fcst["yhat"].values, 0.2, 0.98)
+        return pd.DataFrame({"Date": future["ds"].dt.date, "OccForecast": occ})
+    except Exception:
+        dow_avg = hist.groupby(pd.to_datetime(hist["dt"]).dt.dayofweek)["occupancy"].mean()
+        future = _future_index(days)
+        vals = [dow_avg.get(d.dayofweek, y.mean()) for d in future]
+        return pd.DataFrame({"Date": future.date, "OccForecast": np.clip(vals, 0.2, 0.98)})
+
+# XGBoost 版：銷售量（與 Prophet 並存）
 def forecast_sales_xgb(days: int = 30) -> pd.DataFrame:
-    art = joblib.load("models_store/xgb_sales.pkl")
-    model, FEATURES, LAGS, ROLLS = art["model"], art["features"], art["lags"], art["rolls"]
+    from xgboost import XGBRegressor
+    from sklearn.model_selection import train_test_split
 
-    hist = _load_hist_sales().copy()
-    work = hist.copy()
-    preds = []
+    hist = _load_history()
+    hist = hist.assign(dt=pd.to_datetime(hist["dt"]))
+    hist["dow"] = hist["dt"].dt.dayofweek
+    hist["is_weekend"] = (hist["dow"] >= 5).astype(int)
+    hist["sin_7"] = np.sin(2*np.pi*hist["dt"].dt.dayofyear/7.0)
+    hist["cos_7"] = np.cos(2*np.pi*hist["dt"].dt.dayofyear/7.0)
 
-    # 若 rooms_avail 有缺，先補
-    if "rooms_avail" in work.columns:
-        work["rooms_avail"] = work["rooms_avail"].ffill().bfill()
+    X = hist[["dow", "is_weekend", "sin_7", "cos_7"]]
+    y = hist["rooms_sold"].astype(float)
 
-    current = work["Date"].max()
+    if len(hist) > 20:
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, shuffle=False)
+    else:
+        X_tr, y_tr = X, y
 
-    for _ in range(int(days)):
-        next_date = current + timedelta(days=1)
+    model = XGBRegressor(
+        n_estimators=200, max_depth=3, learning_rate=0.08,
+        subsample=0.9, colsample_bytree=0.9, objective="reg:squarederror"
+    )
+    model.fit(X_tr, y_tr)
 
-        # 用最後一筆 rooms_avail 當未來的供應量（先簡單 ffill）
-        base_avail = work["rooms_avail"].iloc[-1] if "rooms_avail" in work.columns else None
-        new_row = {"Date": next_date, "y": None}
-        if base_avail is not None:
-            new_row["rooms_avail"] = base_avail
-
-        tmp = pd.concat([work, pd.DataFrame([new_row])], ignore_index=True)
-
-        # 造特徵
-        tmp = _add_feats_for_xgb(tmp, LAGS, ROLLS)
-
-        # 再次保證 rooms_avail 不為空
-        if "rooms_avail" in tmp.columns:
-            tmp["rooms_avail"] = tmp["rooms_avail"].ffill().bfill()
-
-        # 有些特徵可能不在 tmp（極少見），做個保底
-        available_feats = [f for f in FEATURES if f in tmp.columns]
-        xrow = tmp.iloc[[-1]][available_feats]
-
-        yhat = float(model.predict(xrow)[0])
-        preds.append({"Date": next_date.date(), "SalesForecast": yhat})
-
-        # 把預測回灌，供下一日 lag/roll 使用
-        work.loc[len(work)] = {"Date": next_date, "y": yhat, **({"rooms_avail": base_avail} if base_avail is not None else {})}
-        current = next_date
-
-    return pd.DataFrame(preds)
-
-
+    future = _future_index(days)
+    F = pd.DataFrame({
+        "dow": future.dayofweek,
+        "is_weekend": (future.dayofweek >= 5).astype(int),
+        "sin_7": np.sin(2*np.pi*future.dayofyear/7.0),
+        "cos_7": np.cos(2*np.pi*future.dayofyear/7.0),
+    })
+    pred = np.maximum(0, np.round(model.predict(F)).astype(int))
+    return pd.DataFrame({"Date": future.date, "SalesForecast": pred})
